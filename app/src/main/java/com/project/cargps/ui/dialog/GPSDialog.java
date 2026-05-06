@@ -204,7 +204,7 @@ public class GPSDialog extends Dialog {
                     uploadSpeed(speedsWithTwoDecimals);
 
                     //SystemClock.elapsedRealtime()
-                    onSaveLocation(myLocation.latitude,myLocation.longitude,androidId,System.currentTimeMillis()/1000,speedsWithTwoDecimals);
+                    onSaveLocation(myLocation.longitude,myLocation.latitude,androidId,System.currentTimeMillis()/1000,speedsWithTwoDecimals);
                     tvSpeeds.setText("速度："+speedsWithTwoDecimals+"Km/h");
 //                }
 
