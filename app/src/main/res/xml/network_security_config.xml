@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- 调试版本允许不安全的HTTP连接 -->
+    <debug-overrides>
+        <trust-anchors>
+            <certificates src="user" />
+            <certificates src="system" />
+        </trust-anchors>
+    </debug-overrides>
+
+    <!-- 基础配置 -->
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+            <!-- 如果有自定义证书，可以在这里添加 -->
+            <!-- <certificates src="@raw/my_certificate" /> -->
+        </trust-anchors>
+    </base-config>
+
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">zdyban.zdeps.com</domain>
+        <domain includeSubdomains="true">byms.wanliii.com</domain>
+    </domain-config>
+
+</network-security-config>

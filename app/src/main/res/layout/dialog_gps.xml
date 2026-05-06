@@ -1,0 +1,104 @@
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:layout_margin="2dp"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:background="#FFFFFF">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical">
+
+        <TextView
+            android:id="@+id/tvMessage"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:textColor="#222222"
+            android:textSize="13sp"  />
+
+        <TextView
+            android:id="@+id/tvSpeeds"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:textColor="#222222"
+            android:textSize="13sp"
+            android:textStyle="bold" />
+       <LinearLayout
+           android:layout_width="match_parent"
+           android:layout_height="wrap_content"
+           android:orientation="horizontal">
+
+           <TextView
+               android:id="@+id/tvLogcat"
+               android:layout_width="wrap_content"
+               android:layout_height="wrap_content"
+               android:paddingHorizontal="3dp"
+               android:paddingVertical="2dp"
+               android:background="#03A9F4"
+               android:gravity="center"
+               android:text="日志列表"
+               android:textColor="#ffffff"
+               android:textSize="13sp" />
+           <TextView
+               android:id="@+id/tvLogcatReport"
+               android:layout_width="wrap_content"
+               android:layout_height="wrap_content"
+               android:paddingHorizontal="3dp"
+               android:layout_marginStart="5dp"
+               android:paddingVertical="2dp"
+               android:background="#03A9F4"
+               android:gravity="center"
+               android:text="上报记录列表"
+               android:textColor="#ffffff"
+               android:textSize="13sp" />
+
+<!--           <TextView-->
+<!--               android:id="@+id/tvHistoryTrack"-->
+<!--               android:layout_width="wrap_content"-->
+<!--               android:layout_height="40dp"-->
+<!--               android:layout_marginTop="10dp"-->
+<!--               android:paddingHorizontal="10dp"-->
+<!--               android:layout_marginStart="5dp"-->
+<!--               android:background="#03A9F4"-->
+<!--               android:gravity="center"-->
+<!--               android:text="查询终端历史轨迹"-->
+<!--               android:textColor="#ffffff"-->
+<!--               android:textSize="15sp"-->
+<!--               android:textStyle="bold" />-->
+       </LinearLayout>
+
+
+
+        <androidx.recyclerview.widget.RecyclerView
+            android:id="@+id/rvGps"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:layout_marginTop="5dp" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/tvClose"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="right"
+        android:paddingHorizontal="10dp"
+        android:paddingBottom="10dp"
+        android:text="关闭"
+        android:textColor="#FA0217"
+        android:textSize="15sp"
+        android:textStyle="bold" />
+
+<!--    <Button-->
+<!--        android:id="@+id/btnRetryCreateTrack"-->
+<!--        android:layout_width="wrap_content"-->
+<!--        android:layout_height="50dp"-->
+<!--        android:background="#FA0217"-->
+<!--        android:textColor="@color/white"-->
+<!--        android:paddingHorizontal="20dp"-->
+<!--        android:visibility="gone"-->
+<!--        tools:visibility="visible"-->
+<!--        android:text="轨迹创建失败，请重试"/>-->
+</FrameLayout>

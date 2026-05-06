@@ -1,0 +1,94 @@
+plugins {
+    alias(libs.plugins.androidApplication)
+}
+
+android {
+    namespace 'com.project.cargps'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.project.cargps"
+        minSdk 17
+        targetSdk 34
+        versionCode 109
+        versionName "1.0.9"
+
+        multiDexEnabled true
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+
+        ndk {
+            abiFilters 'armeabi-v7a', 'arm64-v8a'
+        }
+    }
+
+    signingConfigs {
+        //你自己的keystore信息
+        release {
+            keyAlias 'cargps'
+            keyPassword '85208520'
+            storeFile file('../cargps.jks')
+            storePassword '85208520'
+            v2SigningEnabled true
+        }
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            signingConfig signingConfigs.release
+        }
+
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            signingConfig signingConfigs.release
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    //重定义打包的apk文件名
+    android.applicationVariants.all { variant ->
+        variant.outputs.all {
+            //定义apk名字
+            def apkFileName = "KLZX-GPS_V${versionName}.apk";
+            outputFileName = apkFileName
+        }
+    }
+}
+
+dependencies {
+    implementation fileTree(dir: 'libs',includes: ['*.jar'])
+    implementation libs.appcompat
+    implementation libs.material
+    testImplementation libs.junit
+    androidTestImplementation libs.ext.junit
+    androidTestImplementation libs.espresso.core
+
+    implementation libs.androidAutoSize
+    implementation libs.base.recycler.view
+
+    implementation libs.okhttp3
+    implementation libs.okhttp3.logging
+    implementation libs.retrofit2
+    implementation libs.retrofit2.converter.gson
+    implementation libs.retrofit2.adapter.rxjava2
+
+    implementation libs.xxpermissions
+    implementation libs.google.location
+
+//    implementation("com.amap.api:location:latest.integration")
+
+//    implementation("com.amap.api:3dmap-location-search:latest.integration")
+    implementation("com.amap.api:map2d:latest.integration")
+//    implementation("com.amap.api:search:latest.integration")
+
+    implementation("com.tencent.bugly:crashreport:3.4.4")
+//    implementation("com.tencent.rqd:nativecrashreport:3.9.2")
+
+    implementation libs.work
+}
