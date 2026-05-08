@@ -98,19 +98,24 @@ public class RunAppReceiver extends BroadcastReceiver {
      * 获取当前进程名
      */
     private String getProcessName(Context context) {
-        int pid = android.os.Process.myPid();
-        ActivityManager am = (ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
-        List<ActivityManager.RunningAppProcessInfo> processes = am.getRunningAppProcesses();
-        if (processes == null) {
-            LogUtil.e(LogcatTag, "getRunningAppProcesses() 返回null，使用PackageName作为进程名");
-            return context.getPackageName();
-        }
-        for (ActivityManager.RunningAppProcessInfo info : processes) {
-            if (info.pid == pid) {
-                return info.processName;
+        try {
+            int pid = android.os.Process.myPid();
+            ActivityManager am = (ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
+            List<ActivityManager.RunningAppProcessInfo> processes = am.getRunningAppProcesses();
+            if (processes == null) {
+                LogUtil.e(LogcatTag, "getRunningAppProcesses() 返回null，使用PackageName作为进程名");
+                return context.getPackageName();
             }
+            for (ActivityManager.RunningAppProcessInfo info : processes) {
+                if (info.pid == pid) {
+                    return info.processName;
+                }
+            }
+            return context.getPackageName();
+        } catch (Exception e) {
+            LogUtil.e(LogcatTag, "获取进程名异常: " + e.getMessage());
+            return "unknown";
         }
-        return "unknown";
     }
 
     /**

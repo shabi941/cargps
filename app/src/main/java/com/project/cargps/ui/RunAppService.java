@@ -68,6 +68,7 @@ import com.project.cargps.ui.activity.MainAty;
 import com.project.cargps.util.PermissionUtil;
 import com.project.cargps.util.ServiceIdManagerUtil;
 import com.project.cargps.util.UpdateUtil;
+import com.project.cargps.util.GpsFilter;
 
 import java.io.File;
 import java.io.FileReader;
@@ -117,6 +118,10 @@ public class RunAppService extends Service {
     private boolean isForeground = false;
     private boolean isGPSRunning = false;
     private boolean isDownloadApk = false;
+
+    // GPS过滤：记录上一次有效坐标，用于跳变检测
+    private double lastValidLat = 0;
+    private double lastValidLon = 0;
 
     // GPS待上传队列
     private static final String PENDING_GPS_FILE = "pending_gps.json";
@@ -720,7 +725,21 @@ public class RunAppService extends Service {
             mLocationListener = new AMapLocationListener() {
                 @Override
                 public void onLocationChanged(AMapLocation aMapLocation) {
-                    if (aMapLocation != null && aMapLocation.getLongitude() > 0 && aMapLocation.getLatitude() > 0) {
+                    if (aMapLocation != null) {
+                        // 使用GPS过滤器进行综合检测
+                        boolean hasPrev = (lastValidLat != 0 && lastValidLon != 0);
+                        boolean shouldFilter = GpsFilter.shouldFilter(aMapLocation, lastValidLat, lastValidLon, hasPrev);
+
+                        if (shouldFilter) {
+                            String reason = GpsFilter.getFilterReason(aMapLocation, lastValidLat, lastValidLon, hasPrev);
+                            LogUtil.e(LogcatTag, ">>> GPS数据被过滤: " + reason);
+                            return;
+                        }
+
+                        // 数据有效，更新上一次有效坐标
+                        lastValidLat = aMapLocation.getLatitude();
+                        lastValidLon = aMapLocation.getLongitude();
+
                         LogUtil.e(LogcatTag, ">>> GPS数据: 经度=" + aMapLocation.getLongitude() + ", 纬度=" + aMapLocation.getLatitude());
                         // 获取速度并转换为km/h（高德返回的是米/秒）
                         double speedKmh = aMapLocation.getSpeed() * 3.6;
@@ -729,6 +748,8 @@ public class RunAppService extends Service {
                         myLocation.latitude = aMapLocation.getLatitude();
                         myLocation.longitude = aMapLocation.getLongitude();
                         myLocation.speeds = speedKmh;
+                        myLocation.accuracy = aMapLocation.getAccuracy();
+                        myLocation.locationType = aMapLocation.getLocationType();
 
                         BaseApplication.mCurrentLocation.setValue(myLocation);
 
@@ -736,7 +757,7 @@ public class RunAppService extends Service {
                         onSaveLocation(aMapLocation.getLongitude(), aMapLocation.getLatitude(), androidId, aMapLocation.getTime(), speedKmh);
                         LogUtil.e(LogcatTag, ">>> onSaveLocation调用完成");
                     } else {
-                        LogUtil.e(LogcatTag, ">>> GPS数据无效: " + (aMapLocation != null ? "经度=" + aMapLocation.getLongitude() + ",纬度=" + aMapLocation.getLatitude() : "aMapLocation为null"));
+                        LogUtil.e(LogcatTag, ">>> GPS数据无效: aMapLocation为null");
                     }
                 }
             };
