@@ -203,8 +203,8 @@ public class GPSDialog extends Dialog {
 
                     uploadSpeed(speedsWithTwoDecimals);
 
-                    //SystemClock.elapsedRealtime()
-                    onSaveLocation(myLocation.longitude,myLocation.latitude,androidId,System.currentTimeMillis()/1000,speedsWithTwoDecimals);
+                    // 注意：GPS数据已在RunAppService中上报，此处不再重复调用onSaveLocation
+                    // onSaveLocation(myLocation.longitude,myLocation.latitude,androidId,System.currentTimeMillis()/1000,speedsWithTwoDecimals);
                     tvSpeeds.setText("速度："+speedsWithTwoDecimals+"Km/h");
 //                }
 
