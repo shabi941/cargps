@@ -44,16 +44,13 @@ import com.project.cargps.bean.MyLocation;
 import com.project.cargps.logcat.LogUtil;
 import com.project.cargps.net.ApiService;
 import com.project.cargps.net.OkHttpManage;
-import com.project.cargps.net.PostParams;
 import com.project.cargps.ui.activity.MainAty;
 import com.project.cargps.util.PermissionUtil;
 import com.project.cargps.util.UpdateUtil;
 import com.project.cargps.util.GpsFilter;
 
 import java.io.File;
-import java.util.HashMap;
 
-import okhttp3.RequestBody;
 import retrofit2.Call;
 import retrofit2.Callback;
 import retrofit2.Response;
@@ -97,6 +94,7 @@ public class RunAppGDService extends Service {
     // GPS过滤：记录上一次有效坐标，用于跳变检测
     private double lastValidLat = 0;
     private double lastValidLon = 0;
+    private long lastValidTime = 0;
 
     @SuppressLint("ForegroundServiceType")
     @Override
@@ -243,7 +241,7 @@ public class RunAppGDService extends Service {
 //                locationListener = location -> {
 //                    //LogUtil.e("okhttp", "location：" + location.getLongitude() + "," + location.getLatitude());
 //                    BaseApplication.currentLocation.setValue(location);
-//                    onSaveLocation(location.getLongitude(), location.getLatitude(), androidId, location.getTime());
+//                    位置上传统一由RunAppService处理，RunAppGDService不再上传位置。
 //                };
 //            }
 
@@ -280,17 +278,19 @@ public class RunAppGDService extends Service {
                     if (aMapLocation != null) {
                         // 使用GPS过滤器进行综合检测
                         boolean hasPrev = (lastValidLat != 0 && lastValidLon != 0);
-                        boolean shouldFilter = GpsFilter.shouldFilter(aMapLocation, lastValidLat, lastValidLon, hasPrev);
+                        long timeDiffMs = hasPrev ? aMapLocation.getTime() - lastValidTime : 0;
+                        boolean shouldFilter = GpsFilter.shouldFilter(aMapLocation, lastValidLat, lastValidLon, hasPrev, timeDiffMs);
 
                         if (shouldFilter) {
-                            String reason = GpsFilter.getFilterReason(aMapLocation, lastValidLat, lastValidLon, hasPrev);
-                            LogUtil.e(LogcatTag, ">>> GPS数据被过滤: " + reason);
+                            String reason = GpsFilter.getFilterReason(aMapLocation, lastValidLat, lastValidLon, hasPrev, timeDiffMs);
+                            LogUtil.e(LogcatTag, ">>> GPS数据被app过滤: " + reason);
                             return;
                         }
 
                         // 数据有效，更新上一次有效坐标
                         lastValidLat = aMapLocation.getLatitude();
                         lastValidLon = aMapLocation.getLongitude();
+                        lastValidTime = aMapLocation.getTime();
 
                         LogUtil.e("aMapLocation: getLongitude=" + aMapLocation.getLongitude() + " getLatitude=" + aMapLocation.getLatitude());
                         MyLocation myLocation = new MyLocation();
@@ -304,7 +304,7 @@ public class RunAppGDService extends Service {
 
                         BaseApplication.mCurrentLocation.setValue(myLocation);
 
-                        onSaveLocation(aMapLocation.getLongitude(), aMapLocation.getLatitude(), androidId, aMapLocation.getTime(), speedKmh);
+                        LogUtil.e(LogcatTag, ">>> RunAppGDService 不上传位置，位置上传统一由 RunAppService 队列处理");
                     } else {
                         LogUtil.e(LogcatTag, ">>> GPS数据无效: aMapLocation为null");
                     }
@@ -335,37 +335,6 @@ public class RunAppGDService extends Service {
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
-    }
-
-    /**
-     * 保存定位信息
-     */
-    private void onSaveLocation(double longitude, double latitude, String id, long time, double speed) {
-        String device_no = id == null ? "0" : id;
-        HashMap<String, Object> paramsHashMap = new HashMap<>();
-        paramsHashMap.put("longitude", longitude);
-        paramsHashMap.put("latitude", latitude);
-        paramsHashMap.put("device_no", device_no);
-        paramsHashMap.put("position_time", time);
-        paramsHashMap.put("speed", speed);
-        PostParams postParams = new PostParams();
-        RequestBody requestBody = postParams.getGsonRequestBody(paramsHashMap);
-        LogUtil.e("okhttp", "requestBody:" + gson.toJson(paramsHashMap));
-
-        ApiService apiService = OkHttpManage.instance().create(ApiService.class);
-        Call<Object> call = apiService.saveLocationMsg(requestBody);
-        call.enqueue(new Callback<Object>() {
-            @Override
-            public void onResponse(Call<Object> call, Response<Object> response) {
-                String json = gson.toJson(response.body());
-                LogUtil.e("okhttp", "onResponse:" + json);
-            }
-
-            @Override
-            public void onFailure(Call<Object> call, Throwable t) {
-                LogUtil.e("okhttp", "onFailure:" + t.getMessage());
-            }
-        });
     }
 
     @SuppressLint("MissingPermission")

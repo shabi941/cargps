@@ -15,6 +15,7 @@ import android.widget.Button;
 import android.widget.TextView;
 
 import androidx.annotation.NonNull;
+import androidx.lifecycle.Observer;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
@@ -22,28 +23,18 @@ import androidx.recyclerview.widget.RecyclerView;
 //import com.amap.api.maps.model.LatLng;
 import com.amap.api.maps2d.AMapUtils;
 import com.amap.api.maps2d.model.LatLng;
-import com.google.gson.Gson;
 import com.project.cargps.R;
 import com.project.cargps.base.BaseApplication;
 import com.project.cargps.bean.MyLocation;
 import com.project.cargps.logcat.LogUtil;
 import com.project.cargps.logcat.LogViewerActivity;
 import com.project.cargps.ui.activity.HistoryTrackActivity;
-import com.project.cargps.net.ApiService;
-import com.project.cargps.net.OkHttpManage;
-import com.project.cargps.net.PostParams;
 import com.project.cargps.ui.activity.HistoryUplogActivity;
 import com.project.cargps.ui.adapter.GDGpsMessageAdapter;
 import com.project.cargps.util.ServiceIdManagerUtil;
 
 import java.text.DecimalFormat;
 import java.util.ArrayList;
-import java.util.HashMap;
-
-import okhttp3.RequestBody;
-import retrofit2.Call;
-import retrofit2.Callback;
-import retrofit2.Response;
 
 public class GPSDialog extends Dialog {
 
@@ -61,6 +52,15 @@ public class GPSDialog extends Dialog {
 //    private Button btnRetryCreateTrack;
     private ArrayList<MyLocation> locationMsgList;
     private GDGpsMessageAdapter gpsMessageAdapter;
+    private final Observer<MyLocation> locationObserver = location -> {
+        if (location == null) return;
+        getSpeeds(location);
+        if (locationMsgList.size() >= 100) {
+            locationMsgList.remove(0);
+        }
+        gpsMessageAdapter.addItem(location);
+    };
+    private final Observer<Boolean> trackObserver = isSuccess -> { };
 
     private long clickTryCreateTrachTime;
     @SuppressLint({"MissingPermission", "NewApi"})
@@ -121,17 +121,8 @@ public class GPSDialog extends Dialog {
 //            gpsMessageAdapter.addItem(location);
 //        });
 
-        BaseApplication.mCurrentLocation.observeForever(location -> {
-
-            getSpeeds(location);
-            gpsMessageAdapter.addItem(location);
-
-//            rvGps.smoothScrollToPosition(gpsMessageAdapter.getItemCount());
-        });
-
-        BaseApplication.createTrackResult.observeForever(isSuccess->{
-//            btnRetryCreateTrack.setVisibility(isSuccess?View.GONE:View.VISIBLE);
-        });
+        BaseApplication.mCurrentLocation.observeForever(locationObserver);
+        BaseApplication.createTrackResult.observeForever(trackObserver);
 
 //        MyLocation myLocation = new MyLocation();
 //        myLocation.latitude =  23.219884;
@@ -201,10 +192,7 @@ public class GPSDialog extends Dialog {
                     float speedsWithTwoDecimals = Float.parseFloat(speedsStr);
                     myLocation.speeds = speedsWithTwoDecimals;
 
-                    uploadSpeed(speedsWithTwoDecimals);
-
-                    // 注意：GPS数据已在RunAppService中上报，此处不再重复调用onSaveLocation
-                    // onSaveLocation(myLocation.longitude,myLocation.latitude,androidId,System.currentTimeMillis()/1000,speedsWithTwoDecimals);
+                    // GPSDialog只显示本地估算速度，不再调用速度/位置接口。
                     tvSpeeds.setText("速度："+speedsWithTwoDecimals+"Km/h");
 //                }
 
@@ -223,79 +211,11 @@ public class GPSDialog extends Dialog {
         }
     }
 
-    private Gson gson = new Gson();
-    /**
-     * 注册新的轨迹
-     */
-    void uploadSpeed(float speed) {
-
-        String deviceNo = ServiceIdManagerUtil.getDeviceNo(getContext());
-
-        HashMap<String, Object> paramsHashMap = new HashMap<>();
-        paramsHashMap.put("speed", speed);
-        paramsHashMap.put("device_no", deviceNo );
-
-        PostParams postParams = new PostParams();
-        RequestBody requestBody = postParams.getGsonRequestBody(paramsHashMap);
-        LogUtil.e("okhttp", "requestBody:" + gson.toJson(paramsHashMap));
-
-        ApiService apiService = OkHttpManage.instance().create(ApiService.class);
-        Call<Object> call = apiService.uploadSpeed(requestBody);
-
-        StringBuffer uploadLog = new StringBuffer();
-        uploadLog.append("speed:").append(speed);
-        uploadLog.append("device_no:").append( deviceNo);
-        call.enqueue(new Callback<Object>() {
-            @Override
-            public void onResponse(Call<Object> call, Response<Object> response) {
-                String json = gson.toJson(response.body());
-                LogUtil.e("okhttp", "onResponse:" + json);
-
-                uploadLog.append("ok:").append( json);
-
-                ServiceIdManagerUtil.uploadLog.add(uploadLog.toString());
-            }
-
-            @Override
-            public void onFailure(Call<Object> call, Throwable t) {
-                LogUtil.e("okhttp", "onFailure:" + t.getMessage());
-                uploadLog.append("onFailure:").append( t.getMessage());
-
-                ServiceIdManagerUtil.uploadLog.add(uploadLog.toString());
-            }
-        });
-    }
-
-
-    /**
-     * 保存定位信息
-     */
-    private void onSaveLocation(double longitude, double latitude, String id, long time,float speed) {
-        String device_no = id == null ? "0" : id;
-        HashMap<String, Object> paramsHashMap = new HashMap<>();
-        paramsHashMap.put("longitude", longitude);
-        paramsHashMap.put("latitude", latitude);
-        paramsHashMap.put("device_no", device_no);
-        paramsHashMap.put("position_time", time);
-        paramsHashMap.put("speed", speed); //速度
-        PostParams postParams = new PostParams();
-        RequestBody requestBody = postParams.getGsonRequestBody(paramsHashMap);
-        LogUtil.e("okhttp", "requestBody:" + gson.toJson(paramsHashMap));
-
-        ApiService apiService = OkHttpManage.instance().create(ApiService.class);
-        Call<Object> call = apiService.saveLocationMsg(requestBody);
-        call.enqueue(new Callback<Object>() {
-            @Override
-            public void onResponse(Call<Object> call, Response<Object> response) {
-                String json = gson.toJson(response.body());
-                LogUtil.e("okhttp", "onResponse:" + json);
-            }
-
-            @Override
-            public void onFailure(Call<Object> call, Throwable t) {
-                LogUtil.e("okhttp", "onFailure:" + t.getMessage());
-            }
-        });
+    @Override
+    public void dismiss() {
+        BaseApplication.mCurrentLocation.removeObserver(locationObserver);
+        BaseApplication.createTrackResult.removeObserver(trackObserver);
+        super.dismiss();
     }
 
 }

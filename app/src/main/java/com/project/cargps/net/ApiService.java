@@ -27,10 +27,6 @@ public interface ApiService {
     @POST(NetConstants.UPLOAD_SPEED)
     Call<Object> uploadSpeed(@Body RequestBody requestBody);
 
-    // 注册新轨迹
-    @POST(NetConstants.REGISTER_TRACE)
-    Call<Object> registerTrace(@Body RequestBody requestBody);
-
     // 上传设备日志（文件二进制）
     @Multipart
     @POST(NetConstants.UPLOAD_DEVICE_LOG)

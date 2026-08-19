@@ -13,6 +13,8 @@ import android.content.Context;
 import android.content.BroadcastReceiver;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
 import android.database.Cursor;
@@ -59,6 +61,7 @@ import com.hjq.permissions.permission.PermissionLists;
 import com.project.cargps.R;
 import com.project.cargps.base.BaseApplication;
 import com.project.cargps.bean.MyLocation;
+import com.project.cargps.data.GpsPendingStore;
 import com.project.cargps.logcat.LogManager;
 import com.project.cargps.logcat.LogUtil;
 import com.project.cargps.net.ApiService;
@@ -69,14 +72,14 @@ import com.project.cargps.util.PermissionUtil;
 import com.project.cargps.util.ServiceIdManagerUtil;
 import com.project.cargps.util.UpdateUtil;
 import com.project.cargps.util.GpsFilter;
+import com.project.cargps.util.GpsRecoveryGate;
 
 import java.io.File;
 import java.io.FileReader;
-import java.io.FileWriter;
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.HashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 
 import okhttp3.MediaType;
 import okhttp3.MultipartBody;
@@ -87,6 +90,10 @@ import retrofit2.Response;
 
 public class RunAppService extends Service {
     private static final long LOG_UPLOAD_INTERVAL_MS = 30 * 60 * 1000; // 30分钟
+    private static final long GPS_RETRY_INITIAL_MS = 5 * 1000L;
+    private static final long GPS_RETRY_MAX_MS = 5 * 60 * 1000L;
+    private static final long GPS_SUMMARY_INTERVAL_MS = 60 * 1000L;
+    private static final String GPS_BUILD_REVISION = "113-r1";
     private static final String LogcatTag = "RunAppService";
     private static final int NOTIFICATION_ID = 1;
     private static final String CHANNEL_ID = "GpsUploadChannel";
@@ -122,11 +129,31 @@ public class RunAppService extends Service {
     // GPS过滤：记录上一次有效坐标，用于跳变检测
     private double lastValidLat = 0;
     private double lastValidLon = 0;
+    private long lastValidTime = 0;
+    private final GpsRecoveryGate gpsRecoveryGate = new GpsRecoveryGate();
 
-    // GPS待上传队列
+    // GPS待上传队列。SQLite负责可靠落盘，单线程执行器负责严格串行。
     private static final String PENDING_GPS_FILE = "pending_gps.json";
-    private List<PendingGpsData> pendingGpsList = new ArrayList<>();
+    private final ExecutorService gpsQueueExecutor = Executors.newSingleThreadExecutor();
+    private GpsPendingStore pendingGpsStore;
     private boolean isUploadingPending = false;
+    private int gpsUploadFailureCount = 0;
+    // 失败退避期间只落盘，不让每个新增GPS再次触发请求。
+    private long gpsRetryNotBeforeMs = 0;
+    private long enqueuedSinceSummary = 0;
+    private long uploadedSinceSummary = 0;
+    private long duplicateSinceSummary = 0;
+    private long filteredSinceSummary = 0;
+    private long lastGpsSummaryTime = 0;
+    private volatile boolean serviceDestroyed = false;
+    private volatile Call<Object> currentGpsCall;
+
+    private final Runnable gpsRetryRunnable = new Runnable() {
+        @Override
+        public void run() {
+            uploadPendingGps();
+        }
+    };
 
     // 网络状态监听器
     private BroadcastReceiver networkReceiver = new BroadcastReceiver() {
@@ -146,31 +173,24 @@ public class RunAppService extends Service {
         }
     };
 
-    // 待发送的GPS数据结构
-    static class PendingGpsData {
+    // 仅用于从v1.1.1的pending_gps.json迁移到SQLite。
+    static class LegacyPendingGpsData {
         double longitude;
         double latitude;
         String device_no;
         long position_time;
         long createTime;
         double speed;
-
-        PendingGpsData(double longitude, double latitude, String device_no, long position_time, double speed) {
-            this.longitude = longitude;
-            this.latitude = latitude;
-            this.device_no = device_no;
-            this.position_time = position_time;
-            this.createTime = System.currentTimeMillis();
-            this.speed = speed;
-        }
     }
 
     @SuppressLint("ForegroundServiceType")
     @Override
     public void onCreate() {
         super.onCreate();
-        LogUtil.e(LogcatTag, "onCreate");
+        LogUtil.e(LogcatTag, "onCreate, appVersion=" + getAppVersionInfo()
+                + ", gpsBuild=" + GPS_BUILD_REVISION);
         context = this;
+        pendingGpsStore = new GpsPendingStore(this);
         initManagers();
         createNotificationChannel();
         registerDisplayListener();
@@ -180,13 +200,8 @@ public class RunAppService extends Service {
         registerReceiver(networkReceiver, filter);
         LogUtil.e(LogcatTag, ">>> 网络监听器已注册");
 
-        // 加载本地待发送的GPS数据
-        loadPendingGps();
-
-        //尝试重新创建轨迹
-        BaseApplication.tryCreateTrack.observeForever(tryCreate->{
-//            upTrack();
-        });
+        // 将旧JSON队列迁移到SQLite，再恢复补传。
+        initializeGpsQueue();
 
         // 启动日志上传定时任务
         startLogUploadSchedule();
@@ -198,11 +213,15 @@ public class RunAppService extends Service {
     private void startLogUploadSchedule() {
         LogUtil.e(LogcatTag, ">>> 启动日志上传定时器，间隔=" + LOG_UPLOAD_INTERVAL_MS + "ms");
         // 启动后立即先上传一次，便于验证链路
+        logPendingQueueStatus("schedule_start");
+        uploadPendingGps();
         uploadDeviceLog();
         handler.postDelayed(new Runnable() {
             @Override
             public void run() {
                 LogUtil.e(LogcatTag, ">>> 定时器触发，准备上传日志");
+                logPendingQueueStatus("schedule_tick");
+                uploadPendingGps();
                 uploadDeviceLog();
                 // 继续下一次调度
                 handler.postDelayed(this, LOG_UPLOAD_INTERVAL_MS);
@@ -438,7 +457,7 @@ public class RunAppService extends Service {
 //                locationListener = location -> {
 //                    //LogUtil.e("okhttp", "location：" + location.getLongitude() + "," + location.getLatitude());
 //                    BaseApplication.currentLocation.setValue(location);
-//                    onSaveLocation(location.getLongitude(), location.getLatitude(), androidId, location.getTime());
+//                    旧LocationManager位置上传已禁用，统一走AMap定位与本地队列。
 //                };
 //            }
 
@@ -695,7 +714,6 @@ public class RunAppService extends Service {
                     trackParam.setTrackId(trackId);
                     aMapTrackClient.startTrack(trackParam, onTrackLifecycleListener);
 
-                    registerTrace();
 //                    aMapTrackClient.startTrack(new TrackParam(serviceId, terminalId), onTrackLifecycleListener);
 
                     BaseApplication.createTrackResult.postValue(true);
@@ -728,22 +746,27 @@ public class RunAppService extends Service {
                     if (aMapLocation != null) {
                         // 使用GPS过滤器进行综合检测
                         boolean hasPrev = (lastValidLat != 0 && lastValidLon != 0);
-                        boolean shouldFilter = GpsFilter.shouldFilter(aMapLocation, lastValidLat, lastValidLon, hasPrev);
+                        long timeDiffMs = hasPrev ? aMapLocation.getTime() - lastValidTime : 0;
+                        boolean shouldFilter = GpsFilter.shouldFilter(aMapLocation, lastValidLat, lastValidLon, hasPrev, timeDiffMs);
 
                         if (shouldFilter) {
-                            String reason = GpsFilter.getFilterReason(aMapLocation, lastValidLat, lastValidLon, hasPrev);
-                            LogUtil.e(LogcatTag, ">>> GPS数据被过滤: " + reason);
+                            String reason = GpsFilter.getFilterReason(aMapLocation, lastValidLat, lastValidLon, hasPrev, timeDiffMs);
+                            recordFilteredGps("filtered:" + reason);
+                            return;
+                        }
+                        if (gpsRecoveryGate.shouldHold(aMapLocation.getLatitude(), aMapLocation.getLongitude(),
+                                aMapLocation.getTime(), hasPrev, timeDiffMs)) {
+                            recordFilteredGps("recovery_candidate_hold");
                             return;
                         }
 
                         // 数据有效，更新上一次有效坐标
                         lastValidLat = aMapLocation.getLatitude();
                         lastValidLon = aMapLocation.getLongitude();
+                        lastValidTime = aMapLocation.getTime();
 
-                        LogUtil.e(LogcatTag, ">>> GPS数据: 经度=" + aMapLocation.getLongitude() + ", 纬度=" + aMapLocation.getLatitude());
                         // 获取速度并转换为km/h（高德返回的是米/秒）
                         double speedKmh = aMapLocation.getSpeed() * 3.6;
-                        LogUtil.e(LogcatTag, ">>> 速度=" + speedKmh + " km/h");
                         MyLocation myLocation = new MyLocation();
                         myLocation.latitude = aMapLocation.getLatitude();
                         myLocation.longitude = aMapLocation.getLongitude();
@@ -753,9 +776,15 @@ public class RunAppService extends Service {
 
                         BaseApplication.mCurrentLocation.setValue(myLocation);
 
-                        LogUtil.e(LogcatTag, ">>> 准备调用onSaveLocation上报GPS");
-                        onSaveLocation(aMapLocation.getLongitude(), aMapLocation.getLatitude(), androidId, aMapLocation.getTime(), speedKmh);
-                        LogUtil.e(LogcatTag, ">>> onSaveLocation调用完成");
+                        onSaveLocation(
+                                aMapLocation.getLongitude(),
+                                aMapLocation.getLatitude(),
+                                androidId,
+                                aMapLocation.getTime(),
+                                speedKmh,
+                                aMapLocation.getAccuracy(),
+                                aMapLocation.getLocationType(),
+                                aMapLocation.getSatellites());
                     } else {
                         LogUtil.e(LogcatTag, ">>> GPS数据无效: aMapLocation为null");
                     }
@@ -790,37 +819,44 @@ public class RunAppService extends Service {
     /**
      * 保存定位信息
      */
-    private void onSaveLocation(double longitude, double latitude, String id, long time, double speed) {
-        String device_no = id == null ? "0" : id;
-        HashMap<String, Object> paramsHashMap = new HashMap<>();
-        paramsHashMap.put("longitude", longitude);
-        paramsHashMap.put("latitude", latitude);
-        paramsHashMap.put("device_no", device_no);
-        paramsHashMap.put("position_time", time);
-        // 格式化速度为2位小数，避免GPS原始精度过长
-        paramsHashMap.put("speed", String.format("%.2f", speed));
-        PostParams postParams = new PostParams();
-        RequestBody requestBody = postParams.getGsonRequestBody(paramsHashMap);
-        LogUtil.e("okhttp", "requestBody:" + gson.toJson(paramsHashMap));
-
-        ApiService apiService = OkHttpManage.instance().create(ApiService.class);
-        Call<Object> call = apiService.saveLocationMsg(requestBody);
-        call.enqueue(new Callback<Object>() {
+    private void onSaveLocation(double longitude,
+                                double latitude,
+                                String id,
+                                long time,
+                                double speed,
+                                float accuracy,
+                                int locationType,
+                                int satellites) {
+        final String deviceNo = id == null ? "0" : id;
+        final GpsPendingStore.Record record = new GpsPendingStore.Record(
+                deviceNo,
+                time,
+                longitude,
+                latitude,
+                speed,
+                accuracy,
+                locationType,
+                satellites,
+                System.currentTimeMillis());
+        executeGpsQueueTask(new Runnable() {
             @Override
-            public void onResponse(Call<Object> call, Response<Object> response) {
-                String json = gson.toJson(response.body());
-                LogUtil.e("okhttp", "onResponse:" + json);
-                if (!isResponseSuccess(json)) {
-                    LogUtil.e(LogcatTag, ">>> 服务端返回失败，保存到本地待发送队列");
-                    savePendingGps(new PendingGpsData(longitude, latitude, device_no, time, speed));
+            public void run() {
+                if (serviceDestroyed) {
+                    return;
                 }
-            }
-
-            @Override
-            public void onFailure(Call<Object> call, Throwable t) {
-                LogUtil.e("okhttp", "onFailure:" + t.getMessage() + "，保存到本地待发送队列");
-                // 网络失败，保存到本地队列
-                savePendingGps(new PendingGpsData(longitude, latitude, device_no, time, speed));
+                try {
+                    if (pendingGpsStore.enqueue(record)) {
+                        enqueuedSinceSummary++;
+                    } else {
+                        duplicateSinceSummary++;
+                    }
+                    maybeLogGpsSummary("enqueue");
+                    uploadNextPendingOnQueueThread();
+                } catch (Exception e) {
+                    LogUtil.e(LogcatTag, ">>> GPS enqueue_fail: device_no=" + deviceNo
+                            + ", position_time=" + record.positionTime
+                            + ", error=" + e.getMessage(), e);
+                }
             }
         });
     }
@@ -841,150 +877,246 @@ public class RunAppService extends Service {
         return false;
     }
 
-    /**
-     * 保存待发送的GPS数据到本地
-     */
-    private void savePendingGps(PendingGpsData data) {
-        try {
-            if (containsPendingGps(data)) {
-                LogUtil.e(LogcatTag, ">>> GPS数据已存在本地队列，跳过重复入队: device_no=" + data.device_no + ", position_time=" + data.position_time);
-                return;
+    private void initializeGpsQueue() {
+        executeGpsQueueTask(new Runnable() {
+            @Override
+            public void run() {
+                migrateLegacyGpsQueue();
+                logPendingQueueStatusOnQueueThread("service_start");
+                uploadNextPendingOnQueueThread();
             }
-            pendingGpsList.add(data);
-            File file = new File(context.getFilesDir(), PENDING_GPS_FILE);
-            FileWriter writer = new FileWriter(file);
-            gson.toJson(pendingGpsList, writer);
-            writer.close();
-            LogUtil.e(LogcatTag, ">>> GPS数据已保存到本地，待发送数量=" + pendingGpsList.size());
-        } catch (IOException e) {
-            LogUtil.e(LogcatTag, ">>> 保存GPS数据失败: " + e.getMessage());
-        }
+        });
     }
 
-    private boolean containsPendingGps(PendingGpsData target) {
-        for (PendingGpsData item : pendingGpsList) {
-            if (item != null
-                    && safeEquals(item.device_no, target.device_no)
-                    && item.position_time == target.position_time) {
-                return true;
+    private void migrateLegacyGpsQueue() {
+        File legacyFile = new File(context.getFilesDir(), PENDING_GPS_FILE);
+        if (!legacyFile.exists()) {
+            return;
+        }
+        long migrated = 0;
+        try (FileReader reader = new FileReader(legacyFile)) {
+            JsonElement root = new JsonParser().parse(reader);
+            if (root != null && root.isJsonPrimitive() && root.getAsJsonPrimitive().isString()) {
+                root = new JsonParser().parse(root.getAsString());
             }
-        }
-        return false;
-    }
-
-    private boolean safeEquals(String a, String b) {
-        if (a == null) {
-            return b == null;
-        }
-        return a.equals(b);
-    }
-
-    /**
-     * 加载本地待发送的GPS数据
-     */
-    private void loadPendingGps() {
-        try {
-            File file = new File(context.getFilesDir(), PENDING_GPS_FILE);
-            if (file.exists()) {
-                FileReader reader = new FileReader(file);
-                PendingGpsData[] array = gson.fromJson(reader, PendingGpsData[].class);
-                reader.close();
-                if (array != null) {
-                    for (PendingGpsData data : array) {
-                        pendingGpsList.add(data);
+            LegacyPendingGpsData[] array = gson.fromJson(root, LegacyPendingGpsData[].class);
+            if (array != null) {
+                for (LegacyPendingGpsData item : array) {
+                    if (item == null || item.device_no == null) {
+                        continue;
                     }
-                    LogUtil.e(LogcatTag, ">>> 已加载" + pendingGpsList.size() + "条待发送GPS数据");
+                    GpsPendingStore.Record record = new GpsPendingStore.Record(
+                            item.device_no,
+                            item.position_time,
+                            item.longitude,
+                            item.latitude,
+                            item.speed,
+                            0,
+                            0,
+                            0,
+                            item.createTime > 0 ? item.createTime : System.currentTimeMillis());
+                    if (pendingGpsStore.enqueue(record)) {
+                        migrated++;
+                    }
                 }
             }
+            File migratedFile = new File(context.getFilesDir(),
+                    PENDING_GPS_FILE + ".migrated." + System.currentTimeMillis());
+            if (!legacyFile.renameTo(migratedFile)) {
+                LogUtil.e(LogcatTag, ">>> legacy_queue_migrate_warning: 旧JSON已迁移但无法改名保留");
+            }
+            LogUtil.e(LogcatTag, ">>> legacy_queue_migrate_success: imported=" + migrated);
         } catch (Exception e) {
-            LogUtil.e(LogcatTag, ">>> 加载GPS数据失败: " + e.getMessage());
+            File corruptFile = new File(context.getFilesDir(),
+                    PENDING_GPS_FILE + ".corrupt." + System.currentTimeMillis());
+            boolean preserved = legacyFile.renameTo(corruptFile);
+            LogUtil.e(LogcatTag, ">>> legacy_queue_migrate_fail: preserved=" + preserved
+                    + ", error=" + e.getMessage(), e);
         }
     }
 
-    /**
-     * 上传本地待发送的GPS数据（按顺序）
-     */
     private void uploadPendingGps() {
-        if (isUploadingPending) {
-            LogUtil.e(LogcatTag, ">>> 正在上传中，跳过");
+        if (serviceDestroyed) {
             return;
         }
-        if (pendingGpsList.isEmpty()) {
-            LogUtil.e(LogcatTag, ">>> 没有待发送的GPS数据");
-            return;
-        }
-
-        isUploadingPending = true;
-        LogUtil.e(LogcatTag, ">>> 开始上传" + pendingGpsList.size() + "条待发送GPS数据");
-
-        // 按顺序上传，每条完成后上传下一条
-        uploadNextPending(0);
+        executeGpsQueueTask(new Runnable() {
+            @Override
+            public void run() {
+                // 服务启动、定时重试或网络恢复可主动结束退避。
+                gpsRetryNotBeforeMs = 0;
+                uploadNextPendingOnQueueThread();
+            }
+        });
     }
 
-    private void uploadNextPending(final int index) {
-        if (index >= pendingGpsList.size()) {
-            // 全部上传完成
-            LogUtil.e(LogcatTag, ">>> 全部待发送GPS数据上传完成");
-            pendingGpsList.clear();
-            isUploadingPending = false;
-            // 清空文件
-            try {
-                File file = new File(context.getFilesDir(), PENDING_GPS_FILE);
-                if (file.exists()) {
-                    file.delete();
-                }
-            } catch (Exception e) {
-                LogUtil.e(LogcatTag, ">>> 删除待发送文件失败: " + e.getMessage());
-            }
+    private void uploadNextPendingOnQueueThread() {
+        if (serviceDestroyed || isUploadingPending) {
             return;
         }
-
-        final PendingGpsData data = pendingGpsList.get(index);
+        if (gpsRetryNotBeforeMs > System.currentTimeMillis()) {
+            return;
+        }
+        final GpsPendingStore.Record data;
+        try {
+            data = pendingGpsStore.peekOldest();
+        } catch (Exception e) {
+            LogUtil.e(LogcatTag, ">>> GPS queue_read_fail: " + e.getMessage(), e);
+            scheduleGpsRetry();
+            return;
+        }
+        if (data == null) {
+            gpsUploadFailureCount = 0;
+            gpsRetryNotBeforeMs = 0;
+            handler.removeCallbacks(gpsRetryRunnable);
+            maybeLogGpsSummary("queue_empty");
+            return;
+        }
+        isUploadingPending = true;
         HashMap<String, Object> paramsHashMap = new HashMap<>();
         paramsHashMap.put("longitude", data.longitude);
         paramsHashMap.put("latitude", data.latitude);
-        paramsHashMap.put("device_no", data.device_no);
-        paramsHashMap.put("position_time", data.position_time);
-        // 格式化速度为2位小数，避免GPS原始精度过长
+        paramsHashMap.put("device_no", data.deviceNo);
+        paramsHashMap.put("position_time", data.positionTime);
         paramsHashMap.put("speed", String.format("%.2f", data.speed));
+        // 当前后端会忽略未知字段；先随请求携带，便于后端升级后直接接收。
+        paramsHashMap.put("accuracy", data.accuracy);
+        paramsHashMap.put("location_type", data.locationType);
+        paramsHashMap.put("satellites", data.satellites);
         PostParams postParams = new PostParams();
         RequestBody requestBody = postParams.getGsonRequestBody(paramsHashMap);
 
         ApiService apiService = OkHttpManage.instance().create(ApiService.class);
         Call<Object> call = apiService.saveLocationMsg(requestBody);
+        currentGpsCall = call;
         call.enqueue(new Callback<Object>() {
             @Override
             public void onResponse(Call<Object> call, Response<Object> response) {
                 String json = gson.toJson(response.body());
-                if (isResponseSuccess(json)) {
-                    LogUtil.e(LogcatTag, ">>> 待发送GPS[" + (index + 1) + "/" + pendingGpsList.size() + "]上传成功");
-                    // 更新本地文件（移除已上传的）
-                    pendingGpsList.remove(index);
-                    savePendingGpsListToFile();
-                    // 上传下一条
-                    uploadNextPending(index);
-                } else {
-                    LogUtil.e(LogcatTag, ">>> 待发送GPS[" + (index + 1) + "]服务端返回失败，停止上传，response=" + json);
-                    isUploadingPending = false;
-                }
+                final boolean success = response.isSuccessful() && isResponseSuccess(json);
+                executeGpsQueueTask(new Runnable() {
+                    @Override
+                    public void run() {
+                        currentGpsCall = null;
+                        isUploadingPending = false;
+                        if (serviceDestroyed) {
+                            return;
+                        }
+                        if (success) {
+                            if (pendingGpsStore.delete(data.id)) {
+                                uploadedSinceSummary++;
+                            }
+                            gpsUploadFailureCount = 0;
+                            gpsRetryNotBeforeMs = 0;
+                            handler.removeCallbacks(gpsRetryRunnable);
+                            maybeLogGpsSummary("upload_success");
+                            uploadNextPendingOnQueueThread();
+                        } else {
+                            gpsUploadFailureCount++;
+                            LogUtil.e(LogcatTag, ">>> GPS upload_fail: server, device_no=" + data.deviceNo
+                                    + ", position_time=" + data.positionTime
+                                    + ", http=" + response.code());
+                            scheduleGpsRetry();
+                        }
+                    }
+                });
             }
 
             @Override
             public void onFailure(Call<Object> call, Throwable t) {
-                LogUtil.e(LogcatTag, ">>> 待发送GPS[" + (index + 1) + "]上传失败: " + t.getMessage() + "，停止上传");
-                isUploadingPending = false;
+                executeGpsQueueTask(new Runnable() {
+                    @Override
+                    public void run() {
+                        currentGpsCall = null;
+                        isUploadingPending = false;
+                        if (serviceDestroyed) {
+                            return;
+                        }
+                        gpsUploadFailureCount++;
+                        LogUtil.e(LogcatTag, ">>> GPS upload_fail: network, device_no=" + data.deviceNo
+                                + ", position_time=" + data.positionTime
+                                + ", error=" + t.getMessage());
+                        scheduleGpsRetry();
+                    }
+                });
             }
         });
     }
 
-    private void savePendingGpsListToFile() {
+    private void scheduleGpsRetry() {
+        int shift = Math.min(Math.max(gpsUploadFailureCount - 1, 0), 6);
+        long delay = Math.min(GPS_RETRY_INITIAL_MS * (1L << shift), GPS_RETRY_MAX_MS);
+        gpsRetryNotBeforeMs = System.currentTimeMillis() + delay;
+        handler.removeCallbacks(gpsRetryRunnable);
+        handler.postDelayed(gpsRetryRunnable, delay);
+        LogUtil.e(LogcatTag, ">>> GPS retry_scheduled: delay_ms=" + delay
+                + ", failures=" + gpsUploadFailureCount);
+    }
+
+    private void logPendingQueueStatus(String reason) {
+        executeGpsQueueTask(new Runnable() {
+            @Override
+            public void run() {
+                logPendingQueueStatusOnQueueThread(reason);
+            }
+        });
+    }
+
+    private void logPendingQueueStatusOnQueueThread(String reason) {
+        GpsPendingStore.QueueStats stats = pendingGpsStore.getStats();
+        LogUtil.e(LogcatTag, ">>> GPS queue_status[" + reason + "]: size=" + stats.count
+                + ", first=" + stats.firstPositionTime
+                + ", last=" + stats.lastPositionTime
+                + ", appVersion=" + getAppVersionInfo());
+    }
+
+    private void maybeLogGpsSummary(String reason) {
+        long now = System.currentTimeMillis();
+        if (lastGpsSummaryTime != 0 && now - lastGpsSummaryTime < GPS_SUMMARY_INTERVAL_MS) {
+            return;
+        }
+        lastGpsSummaryTime = now;
+        GpsPendingStore.QueueStats stats = pendingGpsStore == null
+                ? null : pendingGpsStore.getStats();
+        LogUtil.e(LogcatTag, ">>> GPS summary[" + reason + "]: queue="
+                + (stats == null ? -1 : stats.count)
+                + ", enqueued=" + enqueuedSinceSummary
+                + ", uploaded=" + uploadedSinceSummary
+                + ", duplicate=" + duplicateSinceSummary
+                + ", filtered=" + filteredSinceSummary
+                + ", appVersion=" + getAppVersionInfo());
+        enqueuedSinceSummary = 0;
+        uploadedSinceSummary = 0;
+        duplicateSinceSummary = 0;
+        filteredSinceSummary = 0;
+    }
+
+    private void recordFilteredGps(final String reason) {
+        executeGpsQueueTask(new Runnable() {
+            @Override
+            public void run() {
+                filteredSinceSummary++;
+                maybeLogGpsSummary(reason);
+            }
+        });
+    }
+
+    private void executeGpsQueueTask(Runnable task) {
+        if (serviceDestroyed) {
+            return;
+        }
         try {
-            File file = new File(context.getFilesDir(), PENDING_GPS_FILE);
-            FileWriter writer = new FileWriter(file);
-            gson.toJson(pendingGpsList, writer);
-            writer.close();
-        } catch (IOException e) {
-            LogUtil.e(LogcatTag, ">>> 保存待发送列表失败: " + e.getMessage());
+            gpsQueueExecutor.execute(task);
+        } catch (RejectedExecutionException e) {
+            LogUtil.e(LogcatTag, ">>> GPS queue executor已停止，忽略迟到任务");
+        }
+    }
+
+    private String getAppVersionInfo() {
+        try {
+            PackageInfo packageInfo = getPackageManager().getPackageInfo(getPackageName(), 0);
+            return packageInfo.versionName + "(" + packageInfo.versionCode + ")";
+        } catch (PackageManager.NameNotFoundException e) {
+            return "unknown";
         }
     }
 
@@ -1149,57 +1281,33 @@ public class RunAppService extends Service {
     @Override
     public void onDestroy() {
         LogUtil.e(LogcatTag, "onDestroy");
+        serviceDestroyed = true;
         isForeground = false;
+        handler.removeCallbacksAndMessages(null);
+        Call<Object> gpsCall = currentGpsCall;
+        if (gpsCall != null) {
+            gpsCall.cancel();
+        }
+        if (mLocationClient != null) {
+            mLocationClient.stopLocation();
+            mLocationClient.onDestroy();
+            mLocationClient = null;
+        }
+        if (displayManager != null && displayListener != null) {
+            displayManager.unregisterDisplayListener(displayListener);
+        }
         // 注销网络监听器
         try {
             unregisterReceiver(networkReceiver);
         } catch (Exception e) {
             LogUtil.e(LogcatTag, "网络监听器注销失败: " + e.getMessage());
         }
+        try {
+            pendingGpsStore.close();
+        } catch (Exception ignored) {
+        }
+        gpsQueueExecutor.shutdownNow();
         super.onDestroy();
-    }
-
-    /**
-     * 注册新的轨迹
-     */
-    void registerTrace() {
-        String device_no = ServiceIdManagerUtil.getDeviceNo(context);
-        HashMap<String, Object> paramsHashMap = new HashMap<>();
-        paramsHashMap.put("tid", ServiceIdManagerUtil.terminalId);
-        paramsHashMap.put("trid", ServiceIdManagerUtil.trid);
-        paramsHashMap.put("device_no", device_no);
-
-        PostParams postParams = new PostParams();
-        RequestBody requestBody = postParams.getGsonRequestBody(paramsHashMap);
-        LogUtil.e("okhttp", "requestBody:" + gson.toJson(paramsHashMap));
-
-        ApiService apiService = OkHttpManage.instance().create(ApiService.class);
-        Call<Object> call = apiService.registerTrace(requestBody);
-
-        StringBuffer uploadLog = new StringBuffer();
-        uploadLog.append("registerTrace记录:\n");
-        uploadLog.append("paramsHashMap:").append(gson.toJson(paramsHashMap));
-
-
-        call.enqueue(new Callback<Object>() {
-            @Override
-            public void onResponse(Call<Object> call, Response<Object> response) {
-                String json = gson.toJson(response.body());
-                LogUtil.e("okhttp", "onResponse:" + json);
-                uploadLog.append("ok:").append(json);
-
-                ServiceIdManagerUtil.uploadLog.add(uploadLog.toString());
-            }
-
-            @Override
-            public void onFailure(Call<Object> call, Throwable t) {
-                LogUtil.e("okhttp", "onFailure:" + t.getMessage());
-
-                uploadLog.append("onFailure:").append(t.getMessage());
-
-                ServiceIdManagerUtil.uploadLog.add(uploadLog.toString());
-            }
-        });
     }
 
 }

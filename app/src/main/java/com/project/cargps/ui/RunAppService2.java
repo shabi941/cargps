@@ -224,7 +224,7 @@
 //                locationListener = location -> {
 //                    //LogUtil.e("okhttp", "location：" + location.getLongitude() + "," + location.getLatitude());
 //                    BaseApplication.currentLocation.setValue(location);
-//                    onSaveLocation(location.getLongitude(), location.getLatitude(), androidId, location.getTime());
+//                    旧LocationManager位置上传已禁用，统一由RunAppService处理。
 //                };
 //            }
 //
@@ -262,9 +262,9 @@
 //    }
 //
 //    /**
-//     * 保存定位信息
+//     * 旧定位上传逻辑已禁用
 //     */
-//    private void onSaveLocation(double longitude, double latitude, String id, long time) {
+//    private void disabledLocationUpload(double longitude, double latitude, String id, long time) {
 //        String device_no = id == null ? "0" : id;
 //        HashMap<String, Object> paramsHashMap = new HashMap<>();
 //        paramsHashMap.put("longitude", longitude);
@@ -276,7 +276,7 @@
 //        LogUtil.e("okhttp", "requestBody:" + gson.toJson(paramsHashMap));
 //
 //        ApiService apiService = OkHttpManage.instance().create(ApiService.class);
-//        Call<Object> call = apiService.saveLocationMsg(requestBody);
+//        Call<Object> call = null;
 //        call.enqueue(new Callback<Object>() {
 //            @Override
 //            public void onResponse(Call<Object> call, Response<Object> response) {

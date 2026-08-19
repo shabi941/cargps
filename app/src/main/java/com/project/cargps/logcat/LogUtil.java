@@ -15,6 +15,8 @@ import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class LogUtil {
     private static final String TAG = "LogUtil";
@@ -24,10 +26,12 @@ public class LogUtil {
     private static SimpleDateFormat dateFormat;
     private static SimpleDateFormat logDateFormat;
     private static int logWriteCount = 0;
+    private static final ExecutorService FILE_EXECUTOR = Executors.newSingleThreadExecutor();
+    private static final int MAINTENANCE_WRITE_INTERVAL = 500;
 
     public static void init(Context context) {
         dateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault());
-        logDateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault());
+        logDateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault());
 
         // 设置日志文件路径
         if (Environment.getExternalStorageState().equals(Environment.MEDIA_MOUNTED)) {
@@ -46,7 +50,7 @@ public class LogUtil {
         i(TAG, "日志系统初始化完成，日志文件路径: " + logFilePath);
         
         // 启动时清理过期日志（每10次写日志时检查）
-        cleanExpiredLogs();
+        FILE_EXECUTOR.execute(LogUtil::cleanExpiredLogs);
     }
 
     public static void v(String tag, String msg) {
@@ -88,31 +92,24 @@ public class LogUtil {
     private static void writeToFile(String level, String tag, String msg) {
         if (!isLogToFile) return;
 
-        String time = dateFormat.format(new Date());
-        String logMsg = String.format("%s %s/%s: %s\n", time, level, tag, msg);
-
-        FileOutputStream fos = null;
-        try {
-            fos = new FileOutputStream(logFilePath, true);
-            fos.write(logMsg.getBytes("UTF-8"));
-        } catch (IOException e) {
-            Log.e(TAG, "写入日志文件失败", e);
-        } finally {
-            if (fos != null) {
-                try {
-                    fos.close();
-                } catch (IOException e) {
-                    e.printStackTrace();
-                }
+        final String time;
+        synchronized (LogUtil.class) {
+            time = dateFormat.format(new Date());
+        }
+        final String logMsg = String.format("%s %s/%s: %s\n", time, level, tag, msg);
+        FILE_EXECUTOR.execute(() -> {
+            try (FileOutputStream fos = new FileOutputStream(logFilePath, true)) {
+                fos.write(logMsg.getBytes("UTF-8"));
+            } catch (IOException e) {
+                Log.e(TAG, "写入日志文件失败", e);
             }
-        }
-        // 检查并轮转日志文件（每10条检查一次，避免频繁IO）
-        logWriteCount++;
-        if (logWriteCount >= 10) {
-            logWriteCount = 0;
-            LogManager.checkAndRotateLog();
-            cleanExpiredLogs(); // 同时清理过期日志
-        }
+            logWriteCount++;
+            if (logWriteCount >= MAINTENANCE_WRITE_INTERVAL) {
+                logWriteCount = 0;
+                LogManager.checkAndRotateLog();
+                cleanExpiredLogs();
+            }
+        });
     }
 
     private static String getStackTraceString(Throwable tr) {
@@ -195,7 +192,6 @@ public class LogUtil {
         if (file == null || !file.exists() || !file.canWrite()) return;
 
         StringBuilder validLines = new StringBuilder();
-        boolean hasRecentLog = false;
 
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(file), "UTF-8"))) {
             String line;
@@ -204,7 +200,6 @@ public class LogUtil {
                 long lineTime = parseLogLineTime(line);
                 if (lineTime > 0 && lineTime > expireTime) {
                     validLines.append(line).append("\n");
-                    hasRecentLog = true;
                 }
             }
         } catch (IOException e) {
@@ -212,14 +207,10 @@ public class LogUtil {
             return;
         }
 
-        // 只有当有有效日志时才重写文件
-        if (hasRecentLog) {
-            try (FileOutputStream fos = new FileOutputStream(file, false)) {
-                fos.write(validLines.toString().getBytes("UTF-8"));
-                Log.i(TAG, "已清理日志文件中的过期记录，当前保留行数: " + validLines.toString().split("\n").length);
-            } catch (IOException e) {
-                Log.e(TAG, "写入清理后的日志失败: " + e.getMessage());
-            }
+        try (FileOutputStream fos = new FileOutputStream(file, false)) {
+            fos.write(validLines.toString().getBytes("UTF-8"));
+        } catch (IOException e) {
+            Log.e(TAG, "写入清理后的日志失败: " + e.getMessage());
         }
     }
 
@@ -231,7 +222,10 @@ public class LogUtil {
         try {
             // 日志格式：2026-04-29 09:33:24.102 D/Tag: message
             String timeStr = line.substring(0, 23);
-            Date date = logDateFormat.parse(timeStr);
+            Date date;
+            synchronized (LogUtil.class) {
+                date = logDateFormat.parse(timeStr);
+            }
             return date != null ? date.getTime() : 0;
         } catch (ParseException e) {
             return 0;
